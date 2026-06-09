@@ -12,6 +12,15 @@ const envSchema = z.object({
   ARUBA_USERNAME: z.string().min(1),
   ARUBA_PASSWORD: z.string().min(1),
 
+  ARUBA_CEDENTE_PIVA: z.string().default(''),
+  ARUBA_CEDENTE_DENOMINAZIONE: z.string().default(''),
+  ARUBA_CEDENTE_INDIRIZZO: z.string().default(''),
+  ARUBA_CEDENTE_CAP: z.string().default(''),
+  ARUBA_CEDENTE_COMUNE: z.string().default(''),
+  ARUBA_CEDENTE_PROVINCIA: z.string().default(''),
+  ARUBA_CEDENTE_NAZIONE: z.string().default('IT'),
+  ARUBA_CEDENTE_REGIME_FISCALE: z.string().default('RF01'),
+
   ALERT_WEBHOOK_URL: z.preprocess(
     (v) => (v === '' ? undefined : v),
     z.string().url().optional()
