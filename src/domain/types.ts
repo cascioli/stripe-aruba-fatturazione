@@ -8,6 +8,16 @@ export enum JobStatus {
 
 export type EventType = 'invoice.paid' | 'charge.refunded' | 'invoice.voided';
 
+export type TipoDocumento = 'TD01' | 'TD04';
+
+export type NaturaIva =
+  | 'N1'
+  | 'N2.1' | 'N2.2'
+  | 'N3.1' | 'N3.2' | 'N3.3' | 'N3.4' | 'N3.5' | 'N3.6'
+  | 'N4' | 'N5'
+  | 'N6.1' | 'N6.2' | 'N6.3' | 'N6.4' | 'N6.5' | 'N6.6' | 'N6.7' | 'N6.8' | 'N6.9'
+  | 'N7';
+
 export interface FiscalMetadata {
   // Partita IVA o Codice Fiscale
   vatNumber?: string;
@@ -32,23 +42,31 @@ export interface FiscalMetadata {
   nazione: string;
 }
 
-export interface NormalizedLineItem {
+export interface FiscalLineItem {
   description: string;
   quantity: number;
-  unitPrice: number;    // centesimi
-  vatRate: number;      // es. 22 per 22%
-  total: number;        // centesimi
+  unitPrice: number;      // EUR, 2 decimal places
+  vatRate: number | null; // null when natura applies
+  natura: NaturaIva | null;
+  taxableAmount: number;  // EUR, 2 decimal places
+  vatAmount: number;      // EUR, 2 decimal places
 }
 
-export interface NormalizedInvoice {
+export interface FiscalTotals {
+  taxable: number;
+  vat: number;
+  grand: number;
+}
+
+export interface FiscalInvoice {
   stripeInvoiceId: string;
   stripeEventId: string;
-  eventType: EventType;
+  tipoDocumento: TipoDocumento;
   number: string;
   date: Date;
   currency: string;
-  totalAmountCents: number;
   customer: FiscalMetadata;
-  lineItems: NormalizedLineItem[];
+  lineItems: FiscalLineItem[];
+  totals: FiscalTotals;
   notes?: string;
 }
