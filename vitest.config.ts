@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    setupFiles: ['./test/setup.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov', 'html'],
@@ -14,7 +15,7 @@ export default defineConfig({
         statements: 80,
       },
       include: ['src/**/*.ts'],
-      exclude: ['src/index.ts', 'src/db/prisma.ts'],
+      exclude: ['src/index.ts', 'src/server.ts', 'src/db/prisma.ts'],
     },
   },
 });

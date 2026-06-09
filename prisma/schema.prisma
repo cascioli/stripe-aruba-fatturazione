@@ -13,7 +13,7 @@ datasource db {
 model FatturaJob {
   id                  String    @id @default(cuid())
   stripeEventId       String    @unique
-  stripeInvoiceId     String?   @unique
+  stripeInvoiceId     String?
   eventType           String    // invoice.paid | charge.refunded | invoice.voided
 
   status              String    @default("PENDING")
