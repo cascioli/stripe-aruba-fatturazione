@@ -1,0 +1,36 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model FatturaJob {
+  id                  String    @id @default(cuid())
+  stripeEventId       String    @unique
+  stripeInvoiceId     String?   @unique
+  eventType           String    // invoice.paid | charge.refunded | invoice.voided
+
+  status              String    @default("PENDING")
+  // PENDING | CREATED_DRAFT | SENT_SDI | FAILED_VALIDATION | ERROR
+
+  arubaInvoiceId      String?
+  arubaUploadFileName String?
+
+  retryCount          Int       @default(0)
+  nextRetryAt         DateTime?
+  lastError           String?
+
+  rawPayload          String    // JSON evento Stripe (testo)
+
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([status, nextRetryAt])
+  @@index([stripeEventId])
+}
