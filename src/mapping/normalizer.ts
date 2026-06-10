@@ -45,6 +45,7 @@ export interface StripeCharge {
   currency: string;
   created: number;
   metadata?: Record<string, string>;
+  refunds?: { data: Array<{ id: string; amount: number }> };
 }
 
 /**
@@ -207,8 +208,10 @@ export function normalizeInvoice(
  * a fiscally incorrect fallback for an unknown tax treatment.
  *
  * Fiscal metadata precedence: customerMeta → invoice.metadata → charge.metadata.
- * Partial refunds prorate each line by the refund ratio with a deterministic last-line
- * adjustment to absorb rounding so the total matches amount_refunded exactly.
+ *
+ * @param refundAmountOverride - Individual Stripe Refund amount in cents. When provided, uses
+ *   this value instead of charge.amount_refunded (which is cumulative across all refunds).
+ *   Pass this for partial refunds so each credit note covers only the incremental refund amount.
  */
 export function normalizeCharge(
   stripeEventId: string,
@@ -217,12 +220,16 @@ export function normalizeCharge(
   invoice: StripeInvoice,
   customNaturaMap: Record<string, NaturaIva> = {},
   taxRateRegistry: TaxRateRegistry = {},
+  refundAmountOverride?: number,
 ): FiscalInvoice {
   if (!invoice) {
     throw new Error(
       'StripeInvoice richiesto per nota di credito TD04: trattamento IVA non determinabile senza la fattura originale',
     );
   }
+
+  // Use the individual refund amount when provided; fall back to the cumulative total.
+  const refundAmount = refundAmountOverride ?? charge.amount_refunded;
 
   // Precedence: customerMeta → invoice.metadata → charge.metadata
   const customer = extractFiscalMetadata(
@@ -237,12 +244,12 @@ export function normalizeCharge(
       buildLineItem(l, customNaturaMap, taxRateRegistry),
     );
 
-    if (charge.amount_refunded === charge.amount) {
+    if (refundAmount === charge.amount) {
       // Full refund: mirror original invoice lines exactly
       lineItems = originalItems;
     } else {
-      // Partial refund: prorate each line by ratio
-      const ratio = charge.amount_refunded / charge.amount;
+      // Partial refund: prorate each line by the individual refund ratio
+      const ratio = refundAmount / charge.amount;
       lineItems = originalItems.map((item) => ({
         ...item,
         taxableAmount: halfUp(item.taxableAmount * ratio),
@@ -252,7 +259,7 @@ export function normalizeCharge(
 
       // Deterministic rounding fix: adjust last line's taxableAmount to absorb any cent diff
       const sumGrand = halfUp(lineItems.reduce((s, i) => s + i.taxableAmount + i.vatAmount, 0));
-      const expectedGrand = centsToEur(charge.amount_refunded);
+      const expectedGrand = centsToEur(refundAmount);
       const diff = halfUp(expectedGrand - sumGrand);
       if (diff !== 0) {
         const last = lineItems[lineItems.length - 1];
@@ -265,7 +272,7 @@ export function normalizeCharge(
   }
 
   const totals = sumTotals(lineItems);
-  assertConsistency(totals.grand, centsToEur(charge.amount_refunded));
+  assertConsistency(totals.grand, centsToEur(refundAmount));
 
   return {
     stripeInvoiceId: charge.invoice ?? charge.id,

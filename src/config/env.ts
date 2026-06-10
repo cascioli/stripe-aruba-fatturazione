@@ -27,6 +27,25 @@ const envSchema = z.object({
   ),
 });
 
+/**
+ * Validates that the Stripe key type matches the Aruba environment.
+ * Exported for unit testing; also called during module initialisation.
+ */
+export function validateEnvPairing(arubaEnv: 'DEMO' | 'PROD', stripeKey: string): void {
+  if (arubaEnv === 'DEMO' && !stripeKey.startsWith('sk_test_')) {
+    throw new Error(
+      'SECURITY: ARUBA_ENV=DEMO requires STRIPE_SECRET_KEY starting with "sk_test_". ' +
+        'Using a live Stripe key against the Aruba demo environment is forbidden.'
+    );
+  }
+  if (arubaEnv === 'PROD' && !stripeKey.startsWith('sk_live_')) {
+    throw new Error(
+      'SECURITY: ARUBA_ENV=PROD requires STRIPE_SECRET_KEY starting with "sk_live_". ' +
+        'Using a test Stripe key against the Aruba production environment is forbidden.'
+    );
+  }
+}
+
 function parseEnv() {
   const result = envSchema.safeParse(process.env);
 
@@ -38,15 +57,7 @@ function parseEnv() {
   }
 
   const env = result.data;
-
-  // Security: DEMO env must use test Stripe keys
-  if (env.ARUBA_ENV === 'DEMO' && !env.STRIPE_SECRET_KEY.startsWith('sk_test_')) {
-    throw new Error(
-      'SECURITY: ARUBA_ENV=DEMO requires STRIPE_SECRET_KEY starting with "sk_test_". ' +
-        'Using a live Stripe key against the Aruba demo environment is forbidden.'
-    );
-  }
-
+  validateEnvPairing(env.ARUBA_ENV, env.STRIPE_SECRET_KEY);
   return env;
 }
 

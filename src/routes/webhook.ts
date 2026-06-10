@@ -35,6 +35,17 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(400).send({ error: 'Invalid signature' });
     }
 
+    // Bidirectional environment guard: reject events whose livemode doesn't match ARUBA_ENV.
+    // DEMO must only accept test (non-live) events; PROD must only accept live events.
+    const expectedLivemode = env.ARUBA_ENV === 'PROD';
+    if (event.livemode !== expectedLivemode) {
+      fastify.log.warn(
+        { eventId: event.id, livemode: event.livemode, arubaEnv: env.ARUBA_ENV },
+        'Livemode mismatch — event ignored without enqueueing',
+      );
+      return reply.status(200).send({ received: true });
+    }
+
     if (!HANDLED_EVENTS.has(event.type)) {
       fastify.log.info({ eventType: event.type, eventId: event.id }, 'Ignoring unhandled event type');
       return reply.status(200).send({ received: true });
@@ -47,11 +58,25 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
         ? ((obj.invoice as string | null | undefined) ?? null)
         : ((obj.id as string | null | undefined) ?? null);
 
+    // Extract the individual refund ID for per-refund TD04 idempotency (Comment 6)
+    const stripeRefundId =
+      event.type === 'charge.refunded'
+        ? ((
+            (obj.refunds as { data?: Array<{ id: string }> } | undefined)?.data?.[0]?.id
+          ) ?? null)
+        : null;
+
+    // Fiscal document key prevents two Aruba invoices for the same Stripe document,
+    // even if Stripe delivers two different events for the same invoice.paid / refund.
+    const fiscalDocumentKey = computeFiscalDocumentKey(event.type, stripeInvoiceId, stripeRefundId);
+
     try {
       const job = await prisma.fatturaJob.create({
         data: {
           stripeEventId: event.id,
           stripeInvoiceId,
+          stripeRefundId,
+          fiscalDocumentKey,
           eventType: event.type as EventType,
           rawPayload: JSON.stringify(event),
           status: 'PENDING',
@@ -59,7 +84,7 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
       });
       enqueue(job.id);
     } catch (err: unknown) {
-      if (isEventIdDuplicate(err)) {
+      if (isDuplicateKey(err)) {
         fastify.log.info({ eventId: event.id }, 'Evento già ricevuto — idempotenza OK');
         return reply.status(200).send({ received: true });
       }
@@ -70,7 +95,21 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
   });
 };
 
-function isEventIdDuplicate(err: unknown): boolean {
+function computeFiscalDocumentKey(
+  eventType: string,
+  stripeInvoiceId: string | null,
+  stripeRefundId: string | null,
+): string | null {
+  if (!stripeInvoiceId) return null;
+  if (eventType === 'invoice.paid') return `${stripeInvoiceId}:TD01`;
+  if (eventType === 'invoice.voided') return `${stripeInvoiceId}:TD04:voided`;
+  if (eventType === 'charge.refunded' && stripeRefundId) {
+    return `${stripeInvoiceId}:TD04:${stripeRefundId}`;
+  }
+  return null;
+}
+
+function isDuplicateKey(err: unknown): boolean {
   if (
     typeof err !== 'object' ||
     err === null ||
@@ -78,5 +117,6 @@ function isEventIdDuplicate(err: unknown): boolean {
     (err as { code: string }).code !== 'P2002'
   ) return false;
   const meta = (err as { meta?: { target?: string[] } }).meta;
-  return Array.isArray(meta?.target) && meta.target.includes('stripeEventId');
+  if (!Array.isArray(meta?.target)) return false;
+  return meta.target.includes('stripeEventId') || meta.target.includes('fiscalDocumentKey');
 }

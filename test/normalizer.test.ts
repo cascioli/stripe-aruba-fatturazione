@@ -495,3 +495,41 @@ describe('normalizeCharge – with invoice (partial refund)', () => {
     expect(result.lineItems[0].vatRate).toBe(22);
   });
 });
+
+// ---------------------------------------------------------------------------
+// normalizeCharge — per-refund amount override (Comment 6)
+// ---------------------------------------------------------------------------
+
+describe('normalizeCharge – per-refund amount override', () => {
+  it('uses refundAmountOverride instead of cumulative amount_refunded', () => {
+    const inv = makeInvoice(); // 100 taxable + 22 VAT = 122 EUR
+    // Simulate first partial refund: cumulative = 3050, individual = 3050
+    const charge = makeCharge({ amount: 12200, amount_refunded: 3050 });
+    const result = normalizeCharge('evt_1', charge, makeCustomerMeta(), inv, {}, {}, 3050);
+    expect(result.totals.grand).toBe(centsToEur(3050)); // 30.50 EUR
+  });
+
+  it('second partial refund credits only the incremental amount, not the cumulative total', () => {
+    const inv = makeInvoice(); // 100 + 22 = 122 EUR
+    // After two 3050-cent refunds, charge.amount_refunded = 6100 (cumulative).
+    // But this event represents only the second refund of 3050 cents.
+    const charge = makeCharge({ amount: 12200, amount_refunded: 6100 });
+    const result = normalizeCharge('evt_2', charge, makeCustomerMeta(), inv, {}, {}, 3050);
+    expect(result.totals.grand).toBe(centsToEur(3050)); // 30.50, not 61.00
+  });
+
+  it('falls back to charge.amount_refunded when no override is provided', () => {
+    const inv = makeInvoice();
+    const charge = makeCharge({ amount: 12200, amount_refunded: 6100 });
+    const result = normalizeCharge('evt_1', charge, makeCustomerMeta(), inv);
+    expect(result.totals.grand).toBe(centsToEur(6100)); // 61.00 — uses cumulative as default
+  });
+
+  it('full refund via override produces complete credit note', () => {
+    const inv = makeInvoice(); // 122 EUR
+    const charge = makeCharge({ amount: 12200, amount_refunded: 12200 });
+    const result = normalizeCharge('evt_1', charge, makeCustomerMeta(), inv, {}, {}, 12200);
+    expect(result.totals.grand).toBe(122.00);
+    expect(result.lineItems[0].vatRate).toBe(22);
+  });
+});

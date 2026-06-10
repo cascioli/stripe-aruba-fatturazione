@@ -3,7 +3,7 @@ import { setupServer } from 'msw/node';
 import { http, HttpResponse } from 'msw';
 import { processJob } from '../src/worker/processor.js';
 import { enqueue, queue, stopWorker } from '../src/worker/queue.js';
-import { RETRY_DELAYS_MS } from '../src/worker/processor.js';
+import { RETRY_DELAYS_MS, META_SYNC_PENDING, META_SYNC_OK, META_SYNC_FAILED } from '../src/worker/processor.js';
 import {
   DEMO_BASE,
   demoSigninHandler,
@@ -17,14 +17,18 @@ import {
 const {
   mockFindUnique,
   mockFindMany,
+  mockFindFirst,
   mockUpdate,
+  mockUpdateMany,
   mockCreate,
   mockSendAlert,
   mockUpdateStripeMetadata,
 } = vi.hoisted(() => ({
   mockFindUnique: vi.fn(),
   mockFindMany: vi.fn(),
+  mockFindFirst: vi.fn(),
   mockUpdate: vi.fn(),
+  mockUpdateMany: vi.fn(),
   mockCreate: vi.fn(),
   mockSendAlert: vi.fn(),
   mockUpdateStripeMetadata: vi.fn().mockResolvedValue(undefined),
@@ -35,7 +39,9 @@ vi.mock('../src/db/prisma.js', () => ({
     fatturaJob: {
       findUnique: mockFindUnique,
       findMany: mockFindMany,
+      findFirst: mockFindFirst,
       update: mockUpdate,
+      updateMany: mockUpdateMany,
       create: mockCreate,
     },
   },
@@ -160,16 +166,27 @@ afterEach(() => {
   stopWorker();
 });
 
+// Default mocks: claim fails (no Aruba work) and findFirst finds no duplicate
+beforeEach(() => {
+  mockUpdateMany.mockResolvedValue({ count: 0 });
+  mockFindFirst.mockResolvedValue(null);
+});
+
 const pendingValidJob = {
   id: 'job_001',
   stripeEventId: 'evt_test_001',
   stripeInvoiceId: 'in_test_001',
+  stripeRefundId: null,
+  fiscalDocumentKey: null,
   eventType: 'invoice.paid',
   status: 'PENDING',
   arubaInvoiceId: null,
   retryCount: 0,
   nextRetryAt: null,
   lastError: null,
+  metadataSyncStatus: null,
+  lockedAt: null,
+  lockedBy: null,
   rawPayload: makeRawEvent({}),
 };
 
@@ -178,6 +195,7 @@ const sentSdiJob = {
   id: 'job_002',
   status: 'SENT_SDI',
   arubaInvoiceId: 'aruba-inv-already',
+  metadataSyncStatus: META_SYNC_OK,
 };
 
 // Invalid job has same raw payload structure; Stripe MSW handler is overridden per-test
@@ -191,6 +209,8 @@ const pendingInvalidJob = {
 
 describe('processJob: idempotency', () => {
   it('SENT_SDI job skips Aruba — no upload call, no DB write', async () => {
+    // claim fails because job is not PENDING
+    mockUpdateMany.mockResolvedValue({ count: 0 });
     mockFindUnique.mockResolvedValue(sentSdiJob);
 
     let arubaCalled = false;
@@ -208,10 +228,12 @@ describe('processJob: idempotency', () => {
   });
 
   it('job with arubaInvoiceId already set skips processing', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 0 });
     mockFindUnique.mockResolvedValue({
       ...pendingValidJob,
       status: 'CREATED_DRAFT',
       arubaInvoiceId: 'aruba-inv-existing',
+      metadataSyncStatus: META_SYNC_OK,
     });
 
     await processJob('job_001');
@@ -222,21 +244,32 @@ describe('processJob: idempotency', () => {
 
 describe('processJob: success path', () => {
   it('valid data + Aruba 200 → CREATED_DRAFT, arubaInvoiceId saved, Stripe metadata updated', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingValidJob);
     mockUpdate.mockResolvedValue({});
 
     await processJob('job_001');
 
-    expect(mockUpdate).toHaveBeenCalledOnce();
+    // First update: Aruba success persisted with PENDING metadata sync
     expect(mockUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           status: 'CREATED_DRAFT',
           arubaInvoiceId: 'aruba-inv-001',
           lastError: null,
+          metadataSyncStatus: META_SYNC_PENDING,
         }),
       }),
     );
+
+    // Second update: metadata sync confirmed OK
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { metadataSyncStatus: META_SYNC_OK },
+      }),
+    );
+
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
 
     expect(mockUpdateStripeMetadata).toHaveBeenCalledOnce();
     expect(mockUpdateStripeMetadata).toHaveBeenCalledWith('in_test_001', 'aruba-inv-001', 'CREATED_DRAFT');
@@ -247,6 +280,7 @@ describe('processJob: success path', () => {
 
 describe('processJob: validation failure', () => {
   it('invalid fiscal data → FAILED_VALIDATION, no Aruba call, alert sent, Stripe metadata updated', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingInvalidJob);
     mockUpdate.mockResolvedValue({});
 
@@ -294,6 +328,7 @@ describe('processJob: validation failure', () => {
 
 describe('processJob: retry on 5xx', () => {
   it('Aruba 503 → retryCount incremented, nextRetryAt = now+60s, job stays PENDING', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingValidJob);
     mockUpdate.mockResolvedValue({});
 
@@ -320,6 +355,7 @@ describe('processJob: retry on 5xx', () => {
   });
 
   it('second retry uses 5m delay (retryCount=1 → retryCount=2)', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue({ ...pendingValidJob, retryCount: 1 });
     mockUpdate.mockResolvedValue({});
 
@@ -340,6 +376,7 @@ describe('processJob: retry on 5xx', () => {
 
 describe('processJob: single Aruba attempt per invocation (Comment 3)', () => {
   it('Aruba 503 → exactly one upload request per processJob call', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingValidJob);
     mockUpdate.mockResolvedValue({});
 
@@ -357,9 +394,11 @@ describe('processJob: single Aruba attempt per invocation (Comment 3)', () => {
   });
 });
 
-describe('processJob: nextRetryAt eligibility guard (Comment 2)', () => {
+describe('processJob: nextRetryAt eligibility guard', () => {
   it('job with future nextRetryAt skips Aruba without any DB write', async () => {
     const futureRetryAt = new Date(Date.now() + 60_000);
+    // Claim fails because nextRetryAt is in the future
+    mockUpdateMany.mockResolvedValue({ count: 0 });
     mockFindUnique.mockResolvedValue({ ...pendingValidJob, nextRetryAt: futureRetryAt });
 
     let uploadCount = 0;
@@ -379,7 +418,12 @@ describe('processJob: nextRetryAt eligibility guard (Comment 2)', () => {
   it('duplicate queued after 503 does not call Aruba before nextRetryAt expires', async () => {
     const futureRetryAt = new Date(Date.now() + 60_000);
 
-    // First call: PENDING, no nextRetryAt → calls Aruba, gets 503, schedules retry
+    // First call: PENDING, no nextRetryAt → claims → calls Aruba → gets 503 → schedules retry
+    // Second call: claim fails because nextRetryAt is now in the future
+    mockUpdateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
     mockFindUnique
       .mockResolvedValueOnce(pendingValidJob)
       .mockResolvedValueOnce({ ...pendingValidJob, nextRetryAt: futureRetryAt });
@@ -396,7 +440,7 @@ describe('processJob: nextRetryAt eligibility guard (Comment 2)', () => {
     await processJob('job_001');
     expect(uploadCount).toBe(1);
 
-    // Second call (duplicate) — DB now shows future nextRetryAt → must skip
+    // Second call — future nextRetryAt — must skip
     await processJob('job_001');
     expect(uploadCount).toBe(1);
   });
@@ -404,6 +448,7 @@ describe('processJob: nextRetryAt eligibility guard (Comment 2)', () => {
 
 describe('processJob: Stripe metadata writeback on Aruba 4xx failure', () => {
   it('Aruba 400 → ERROR/FAILED_VALIDATION status, alert, Stripe metadata updated', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingValidJob);
     mockUpdate.mockResolvedValue({});
 
@@ -427,8 +472,156 @@ describe('processJob: Stripe metadata writeback on Aruba 4xx failure', () => {
   });
 });
 
+describe('processJob: Aruba success with metadata sync failure (Comment 4)', () => {
+  it('Aruba success + metadata fails → arubaInvoiceId persisted, metadataSyncStatus=FAILED, alert sent', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+    mockFindUnique.mockResolvedValue(pendingValidJob);
+    mockUpdate.mockResolvedValue({});
+    mockUpdateStripeMetadata.mockRejectedValue(new Error('Stripe API timeout'));
+
+    await processJob('job_001');
+
+    // First update: Aruba result persisted before metadata attempt
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'CREATED_DRAFT',
+          arubaInvoiceId: 'aruba-inv-001',
+          metadataSyncStatus: META_SYNC_PENDING,
+        }),
+      }),
+    );
+
+    // Second update: metadata failure recorded
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { metadataSyncStatus: META_SYNC_FAILED },
+      }),
+    );
+
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+
+    expect(mockSendAlert).toHaveBeenCalledOnce();
+    const alertPayload = mockSendAlert.mock.calls[0][0] as { reason: string };
+    expect(alertPayload.reason).toContain('metadata');
+  });
+
+  it('metadata retry path: job with FAILED metadataSyncStatus retries metadata without Aruba', async () => {
+    const jobWithFailedMeta = {
+      ...pendingValidJob,
+      status: 'CREATED_DRAFT',
+      arubaInvoiceId: 'aruba-inv-001',
+      metadataSyncStatus: META_SYNC_FAILED,
+    };
+
+    // Claim fails (not PENDING), but metadata retry should fire
+    mockUpdateMany.mockResolvedValue({ count: 0 });
+    mockFindUnique.mockResolvedValue(jobWithFailedMeta);
+    mockUpdate.mockResolvedValue({});
+    mockUpdateStripeMetadata.mockResolvedValue(undefined);
+
+    let arubaCalled = false;
+    server.use(
+      http.post(`${DEMO_BASE}/services/invoice/out/uploadFile`, () => {
+        arubaCalled = true;
+        return HttpResponse.json({ arubaInvoiceId: 'aruba-inv-new' });
+      }),
+    );
+
+    await processJob('job_001');
+
+    expect(arubaCalled).toBe(false);
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledOnce();
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledWith('in_test_001', 'aruba-inv-001', 'CREATED_DRAFT');
+    expect(mockUpdate).toHaveBeenCalledOnce();
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { metadataSyncStatus: META_SYNC_OK },
+      }),
+    );
+  });
+});
+
+describe('processJob: concurrent claim guard (Comment 3)', () => {
+  it('two concurrent processJob calls → only one Aruba upload', async () => {
+    let uploadCount = 0;
+    server.use(
+      http.post(`${DEMO_BASE}/services/invoice/out/uploadFile`, () => {
+        uploadCount++;
+        return HttpResponse.json({ arubaInvoiceId: 'aruba-inv-001' });
+      }),
+    );
+
+    // First call wins the atomic claim; second call loses
+    mockUpdateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
+    // First call: re-reads job after claim; second call: reads job for metadata check (OK → no retry)
+    mockFindUnique
+      .mockResolvedValueOnce(pendingValidJob)
+      .mockResolvedValueOnce({
+        ...pendingValidJob,
+        status: 'CREATED_DRAFT',
+        arubaInvoiceId: 'aruba-inv-001',
+        metadataSyncStatus: META_SYNC_OK,
+      });
+
+    mockUpdate.mockResolvedValue({});
+
+    await Promise.all([processJob('job_001'), processJob('job_001')]);
+
+    expect(uploadCount).toBe(1);
+  });
+});
+
+describe('processJob: charge.refunded with expanded tax rates (Comment 5)', () => {
+  it('charge.refunded with tax-rate IDs resolves them via expanded invoice retrieve', async () => {
+    const chargeRefundedJob = {
+      ...pendingValidJob,
+      id: 'job_refund_001',
+      eventType: 'charge.refunded',
+      stripeInvoiceId: 'in_test_001',
+      rawPayload: JSON.stringify({
+        id: 'evt_refund_001',
+        type: 'charge.refunded',
+        data: {
+          object: {
+            id: 'ch_test_001',
+            invoice: 'in_test_001',
+            amount: 12200,
+            amount_refunded: 12200,
+            currency: 'eur',
+            created: 1700000100,
+            refunds: {
+              data: [{ id: 're_test_001', amount: 12200 }],
+            },
+          },
+        },
+      }),
+    };
+
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+    mockFindUnique.mockResolvedValue(chargeRefundedJob);
+    mockUpdate.mockResolvedValue({});
+
+    // stripeInvoiceRetrieveHandler returns invoice with expanded 22% tax rate
+    await processJob('job_refund_001');
+
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'CREATED_DRAFT',
+          arubaInvoiceId: 'aruba-inv-001',
+        }),
+      }),
+    );
+  });
+});
+
 describe('enqueue: async decoupling', () => {
   it('enqueue returns synchronously before Aruba is called (webhook can ACK first)', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingValidJob);
     mockUpdate.mockResolvedValue({});
 
@@ -453,8 +646,9 @@ describe('enqueue: async decoupling', () => {
   });
 });
 
-describe('enqueue: deduplication (Comment 2)', () => {
+describe('enqueue: deduplication', () => {
   it('duplicate enqueue while job in-flight is ignored — only one upload call', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
     mockFindUnique.mockResolvedValue(pendingValidJob);
     mockUpdate.mockResolvedValue({});
 
