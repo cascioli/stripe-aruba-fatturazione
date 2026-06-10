@@ -71,3 +71,10 @@ export function getArubaBaseUrl(): string {
   }
   return 'https://ws.fatturazioneelettronica.aruba.it';
 }
+
+export function getArubaAuthBaseUrl(): string {
+  if (env.ARUBA_ENV === 'DEMO') {
+    return 'https://demoauth.fatturazioneelettronica.aruba.it';
+  }
+  return 'https://auth.fatturazioneelettronica.aruba.it';
+}

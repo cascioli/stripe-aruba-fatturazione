@@ -2,10 +2,11 @@ import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { setupServer } from 'msw/node';
 import { delay, http, HttpResponse } from 'msw';
 import { ArubaTokenManager, ArubaAuthTransientError, ArubaAuthPermanentError } from '../src/aruba/auth.js';
-import { getArubaBaseUrl } from '../src/config/env.js';
+import { getArubaBaseUrl, getArubaAuthBaseUrl } from '../src/config/env.js';
 import {
   DEMO_BASE,
   PROD_BASE,
+  DEMO_AUTH_BASE,
   validTokenResponse,
   demoSigninHandler,
   prodSigninHandler,
@@ -119,9 +120,12 @@ describe('ArubaTokenManager', () => {
     expect(callCount).toBe(2);
   });
 
-  it('ARUBA_ENV=DEMO → getArubaBaseUrl returns DEMO URL', () => {
-    // env is set to DEMO in test/setup.ts
+  it('ARUBA_ENV=DEMO → getArubaBaseUrl returns DEMO ws URL', () => {
     expect(getArubaBaseUrl()).toBe(DEMO_BASE);
+  });
+
+  it('ARUBA_ENV=DEMO → getArubaAuthBaseUrl returns DEMO auth URL', () => {
+    expect(getArubaAuthBaseUrl()).toBe(DEMO_AUTH_BASE);
   });
 
   it('uses DEMO URL, not PROD URL', async () => {

@@ -58,13 +58,24 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
         ? ((obj.invoice as string | null | undefined) ?? null)
         : ((obj.id as string | null | undefined) ?? null);
 
-    // Extract the individual refund ID for per-refund TD04 idempotency (Comment 6)
-    const stripeRefundId =
-      event.type === 'charge.refunded'
-        ? ((
-            (obj.refunds as { data?: Array<{ id: string }> } | undefined)?.data?.[0]?.id
-          ) ?? null)
-        : null;
+    // Extract the triggering refund ID deterministically using data.previous_attributes
+    // to compute the amount delta, then match against refunds.data.
+    // If the refund cannot be identified unambiguously, the job is created as
+    // FAILED_VALIDATION rather than PENDING so no Aruba call is attempted without a
+    // unique fiscal document key.
+    let stripeRefundId: string | null = null;
+    let jobStatus: 'PENDING' | 'FAILED_VALIDATION' = 'PENDING';
+
+    if (event.type === 'charge.refunded') {
+      const charge = obj as {
+        amount_refunded?: number;
+        refunds?: { data: Array<{ id: string; amount: number }> };
+      };
+      const prevAttrs =
+        (event.data.previous_attributes as { amount_refunded?: number } | undefined) ?? null;
+      stripeRefundId = extractTriggeringRefundId(charge, prevAttrs);
+      jobStatus = stripeRefundId !== null ? 'PENDING' : 'FAILED_VALIDATION';
+    }
 
     // Fiscal document key prevents two Aruba invoices for the same Stripe document,
     // even if Stripe delivers two different events for the same invoice.paid / refund.
@@ -79,10 +90,14 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
           fiscalDocumentKey,
           eventType: event.type as EventType,
           rawPayload: JSON.stringify(event),
-          status: 'PENDING',
+          status: jobStatus,
+          ...(jobStatus === 'FAILED_VALIDATION' && {
+            lastError: 'Unable to identify triggering Stripe refund deterministically',
+            metadataSyncStatus: stripeInvoiceId ? 'PENDING' : null,
+          }),
         },
       });
-      enqueue(job.id);
+      if (jobStatus === 'PENDING' || jobStatus === 'FAILED_VALIDATION') enqueue(job.id);
     } catch (err: unknown) {
       if (isDuplicateKey(err)) {
         fastify.log.info({ eventId: event.id }, 'Evento già ricevuto — idempotenza OK');
@@ -94,6 +109,28 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.status(200).send({ received: true });
   });
 };
+
+/**
+ * Identify the single refund that triggered a charge.refunded event.
+ * Uses event.data.previous_attributes.amount_refunded to compute the delta, then finds the unique
+ * refund in refunds.data whose amount equals that delta.
+ * Returns null when the match is ambiguous (multiple refunds with the same amount) or missing.
+ */
+function extractTriggeringRefundId(
+  charge: { amount_refunded?: number; refunds?: { data: Array<{ id: string; amount: number }> } },
+  prevAttrs: { amount_refunded?: number } | null,
+): string | null {
+  const refundsData = charge.refunds?.data ?? [];
+  if (refundsData.length === 0) return null;
+
+  if (prevAttrs?.amount_refunded !== undefined) {
+    const delta = (charge.amount_refunded ?? 0) - prevAttrs.amount_refunded;
+    const candidates = refundsData.filter((r) => r.amount === delta);
+    return candidates.length === 1 ? candidates[0].id : null;
+  }
+
+  return refundsData.length === 1 ? refundsData[0].id : null;
+}
 
 function computeFiscalDocumentKey(
   eventType: string,

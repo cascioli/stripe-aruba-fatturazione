@@ -1,4 +1,4 @@
-import { env, getArubaBaseUrl } from '../config/env.js';
+import { env, getArubaAuthBaseUrl } from '../config/env.js';
 
 const REFRESH_BUFFER_MS = 60_000;
 
@@ -39,7 +39,7 @@ export class ArubaTokenManager {
   private _cached: CachedToken | null = null;
 
   constructor(
-    private readonly baseUrl: string = getArubaBaseUrl(),
+    private readonly baseUrl: string = getArubaAuthBaseUrl(),
     private readonly username: string = env.ARUBA_USERNAME,
     private readonly password: string = env.ARUBA_PASSWORD,
     private readonly timeoutMs: number = 30_000,

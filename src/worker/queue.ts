@@ -29,7 +29,7 @@ export function stopWorker(): void {
   queue.clear();
 }
 
-async function pollPendingJobs(): Promise<void> {
+export async function pollPendingJobs(): Promise<void> {
   const now = new Date();
   const staleCutoff = new Date(now.getTime() - STALE_LOCK_MS);
 
@@ -44,9 +44,9 @@ async function pollPendingJobs(): Promise<void> {
             { OR: [{ lockedAt: null }, { lockedAt: { lte: staleCutoff } }] },
           ],
         },
-        // Jobs that finished Aruba but still need the Stripe metadata write-back
+        // Jobs with a Stripe invoice that still need the metadata write-back (success or failure state)
         {
-          arubaInvoiceId: { not: null },
+          stripeInvoiceId: { not: null },
           metadataSyncStatus: { in: [META_SYNC_PENDING, META_SYNC_FAILED] },
         },
       ],

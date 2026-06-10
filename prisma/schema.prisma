@@ -27,7 +27,8 @@ model FatturaJob {
   arubaUploadFileName String?
 
   // Tracks metadata write-back to Stripe independently of Aruba status.
-  // null = not yet needed | PENDING = Aruba done, sync not yet attempted | OK = synced | FAILED = needs retry
+  // Covers both success states (arubaInvoiceId present) and failure states (status-only write-back).
+  // null = not yet needed | PENDING = write-back needed (not yet attempted) | OK = synced | FAILED = needs retry
   metadataSyncStatus  String?
 
   // Optimistic lock fields for atomic job claiming — prevents concurrent Aruba calls.
@@ -37,6 +38,7 @@ model FatturaJob {
   retryCount          Int       @default(0)
   nextRetryAt         DateTime?
   lastError           String?
+  alerted             Boolean   @default(false)
 
   rawPayload          String    // JSON evento Stripe (testo)
 

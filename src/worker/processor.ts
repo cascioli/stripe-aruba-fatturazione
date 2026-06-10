@@ -1,6 +1,6 @@
 import Stripe from 'stripe';
 import { prisma } from '../db/prisma.js';
-import { env, getArubaBaseUrl } from '../config/env.js';
+import { env, getArubaAuthBaseUrl, getArubaBaseUrl } from '../config/env.js';
 import { JobStatus } from '../domain/types.js';
 import type { FiscalInvoice } from '../domain/types.js';
 import { validateFiscalData } from '../mapping/fiscal-validator.js';
@@ -50,7 +50,7 @@ function buildTaxRateRegistry(invoice: Stripe.Invoice): TaxRateRegistry {
 
 function buildArubaClient(): ArubaClient {
   const tokenManager = new ArubaTokenManager(
-    getArubaBaseUrl(),
+    getArubaAuthBaseUrl(),
     env.ARUBA_USERNAME,
     env.ARUBA_PASSWORD,
   );
@@ -68,6 +68,7 @@ async function extractFiscalInvoice(job: {
   stripeEventId: string;
   eventType: string;
   rawPayload: string;
+  stripeRefundId: string | null;
 }): Promise<FiscalInvoice> {
   const event = JSON.parse(job.rawPayload) as RawStripeEvent;
 
@@ -148,10 +149,18 @@ async function extractFiscalInvoice(job: {
       metadata: stripeInvoice.metadata ?? {},
     };
 
-    // Use the individual refund amount (first entry in refunds list = most recent) rather than
-    // the cumulative charge.amount_refunded, which would overstate subsequent partial refunds.
-    const latestRefundAmount = chargeObj.refunds?.data?.[0]?.amount;
-    const refundAmountOverride = latestRefundAmount ?? chargeObj.amount_refunded;
+    // stripeRefundId was set deterministically at webhook time; use it to select the specific
+    // refund entry rather than falling back to the cumulative charge.amount_refunded.
+    if (!job.stripeRefundId) {
+      throw new Error('charge.refunded: stripeRefundId not set — cannot determine individual refund amount');
+    }
+    const matchedRefund = chargeObj.refunds?.data?.find((r) => r.id === job.stripeRefundId);
+    if (!matchedRefund) {
+      throw new Error(
+        `charge.refunded: refund '${job.stripeRefundId}' not found in charge payload refunds`,
+      );
+    }
+    const refundAmountOverride = matchedRefund.amount;
 
     return normalizeCharge(
       event.id,
@@ -167,14 +176,17 @@ async function extractFiscalInvoice(job: {
   throw new Error(`Unsupported eventType: ${job.eventType}`);
 }
 
-/** Retry only the Stripe metadata write-back without re-invoking Aruba. */
+/**
+ * Perform (or retry) the Stripe metadata write-back without re-invoking Aruba.
+ * Handles both success states (arubaInvoiceId present) and failure states (arubaInvoiceId null).
+ */
 async function retryMetadataSync(job: {
   id: string;
   stripeInvoiceId: string | null;
   arubaInvoiceId: string | null;
   status: string;
 }): Promise<void> {
-  if (!job.arubaInvoiceId || !job.stripeInvoiceId) return;
+  if (!job.stripeInvoiceId) return;
 
   try {
     await updateStripeMetadata(job.stripeInvoiceId, job.arubaInvoiceId, job.status);
@@ -218,11 +230,33 @@ export async function processJob(jobId: string): Promise<void> {
   });
 
   if (claimed.count === 0) {
-    // Job not claimable for Aruba — check if a metadata-only retry is needed.
+    // Job not claimable for Aruba — handle alert + metadata-only retry as needed.
     const job = await prisma.fatturaJob.findUnique({ where: { id: jobId } });
     if (!job) return;
+
+    // Atomic alert gate: exactly-once alert for failure-state jobs created by the webhook.
+    // updateMany constrained by alerted:false ensures two concurrent workers cannot both send.
+    if (job.status === JobStatus.FAILED_VALIDATION || job.status === JobStatus.ERROR) {
+      const alertClaimed = await prisma.fatturaJob.updateMany({
+        where: {
+          id: jobId,
+          alerted: false,
+          status: { in: [JobStatus.FAILED_VALIDATION, JobStatus.ERROR] },
+        },
+        data: { alerted: true },
+      });
+      if (alertClaimed.count === 1) {
+        await sendAlert({
+          jobId,
+          stripeInvoiceId: job.stripeInvoiceId,
+          reason: job.lastError ?? 'Job in failure state',
+          errors: job.lastError ? [job.lastError] : [],
+        });
+      }
+    }
+
     if (
-      job.arubaInvoiceId &&
+      job.stripeInvoiceId &&
       (job.metadataSyncStatus === META_SYNC_PENDING || job.metadataSyncStatus === META_SYNC_FAILED)
     ) {
       await retryMetadataSync(job);
@@ -265,7 +299,14 @@ export async function processJob(jobId: string): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
     await prisma.fatturaJob.update({
       where: { id: jobId },
-      data: { status: JobStatus.FAILED_VALIDATION, lastError: message, lockedAt: null, lockedBy: null },
+      data: {
+        status: JobStatus.FAILED_VALIDATION,
+        lastError: message,
+        lockedAt: null,
+        lockedBy: null,
+        metadataSyncStatus: job.stripeInvoiceId ? META_SYNC_PENDING : null,
+        alerted: true,
+      },
     });
     await sendAlert({
       jobId,
@@ -274,7 +315,7 @@ export async function processJob(jobId: string): Promise<void> {
       errors: [message],
     });
     if (job.stripeInvoiceId) {
-      await updateStripeMetadata(job.stripeInvoiceId, null, JobStatus.FAILED_VALIDATION).catch(() => {});
+      await retryMetadataSync({ ...job, arubaInvoiceId: null, status: JobStatus.FAILED_VALIDATION });
     }
     return;
   }
@@ -288,6 +329,8 @@ export async function processJob(jobId: string): Promise<void> {
         lastError: validation.errors.join('; '),
         lockedAt: null,
         lockedBy: null,
+        metadataSyncStatus: job.stripeInvoiceId ? META_SYNC_PENDING : null,
+        alerted: true,
       },
     });
     await sendAlert({
@@ -297,7 +340,7 @@ export async function processJob(jobId: string): Promise<void> {
       errors: validation.errors,
     });
     if (job.stripeInvoiceId) {
-      await updateStripeMetadata(job.stripeInvoiceId, null, JobStatus.FAILED_VALIDATION).catch(() => {});
+      await retryMetadataSync({ ...job, arubaInvoiceId: null, status: JobStatus.FAILED_VALIDATION });
     }
     return;
   }
@@ -373,7 +416,14 @@ export async function processJob(jobId: string): Promise<void> {
 
   await prisma.fatturaJob.update({
     where: { id: jobId },
-    data: { status: errorStatus, lastError: result.message, lockedAt: null, lockedBy: null },
+    data: {
+      status: errorStatus,
+      lastError: result.message,
+      lockedAt: null,
+      lockedBy: null,
+      metadataSyncStatus: job.stripeInvoiceId ? META_SYNC_PENDING : null,
+      alerted: true,
+    },
   });
   await sendAlert({
     jobId,
@@ -382,6 +432,6 @@ export async function processJob(jobId: string): Promise<void> {
     errors: [result.message],
   });
   if (job.stripeInvoiceId) {
-    await updateStripeMetadata(job.stripeInvoiceId, null, errorStatus).catch(() => {});
+    await retryMetadataSync({ ...job, arubaInvoiceId: null, status: errorStatus });
   }
 }

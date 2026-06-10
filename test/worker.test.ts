@@ -6,7 +6,7 @@ import { enqueue, queue, stopWorker } from '../src/worker/queue.js';
 import { RETRY_DELAYS_MS, META_SYNC_PENDING, META_SYNC_OK, META_SYNC_FAILED } from '../src/worker/processor.js';
 import {
   DEMO_BASE,
-  demoSigninHandler,
+  demoAuthSigninHandler,
   demoUploadSuccessHandler,
   demoUpload503Handler,
   validTokenResponse,
@@ -156,7 +156,7 @@ const stripeInvoiceRetrieveHandler = http.get(
 
 // --- MSW server ---
 
-const server = setupServer(demoSigninHandler, demoUploadSuccessHandler, stripeInvoiceRetrieveHandler);
+const server = setupServer(demoAuthSigninHandler, demoUploadSuccessHandler, stripeInvoiceRetrieveHandler);
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'bypass' }));
 afterAll(() => server.close());
@@ -185,6 +185,7 @@ const pendingValidJob = {
   nextRetryAt: null,
   lastError: null,
   metadataSyncStatus: null,
+  alerted: false,
   lockedAt: null,
   lockedBy: null,
   rawPayload: makeRawEvent({}),
@@ -306,12 +307,22 @@ describe('processJob: validation failure', () => {
 
     expect(arubaCalled).toBe(false);
 
-    expect(mockUpdate).toHaveBeenCalledOnce();
+    // First update: FAILED_VALIDATION with metadataSyncStatus=PENDING
     expect(mockUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: 'FAILED_VALIDATION' }),
+        data: expect.objectContaining({
+          status: 'FAILED_VALIDATION',
+          metadataSyncStatus: 'PENDING',
+        }),
       }),
     );
+    // Second update: metadata sync confirmed OK
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { metadataSyncStatus: 'OK' },
+      }),
+    );
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
 
     expect(mockSendAlert).toHaveBeenCalledOnce();
     const alertPayload = mockSendAlert.mock.calls[0][0] as {
@@ -461,9 +472,15 @@ describe('processJob: Stripe metadata writeback on Aruba 4xx failure', () => {
 
     await processJob('job_001');
 
-    expect(mockUpdate).toHaveBeenCalledOnce();
-    const updateData = (mockUpdate.mock.calls[0][0] as { data: { status: string } }).data;
-    expect(updateData.status).toBe('FAILED_VALIDATION');
+    // First update: FAILED_VALIDATION with metadataSyncStatus=PENDING
+    const firstUpdateData = (mockUpdate.mock.calls[0][0] as { data: { status: string; metadataSyncStatus: string } }).data;
+    expect(firstUpdateData.status).toBe('FAILED_VALIDATION');
+    expect(firstUpdateData.metadataSyncStatus).toBe('PENDING');
+    // Second update: metadata sync OK
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { metadataSyncStatus: 'OK' } }),
+    );
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
 
     expect(mockSendAlert).toHaveBeenCalledOnce();
 
@@ -582,6 +599,7 @@ describe('processJob: charge.refunded with expanded tax rates (Comment 5)', () =
       id: 'job_refund_001',
       eventType: 'charge.refunded',
       stripeInvoiceId: 'in_test_001',
+      stripeRefundId: 're_test_001',
       rawPayload: JSON.stringify({
         id: 'evt_refund_001',
         type: 'charge.refunded',
@@ -643,6 +661,285 @@ describe('enqueue: async decoupling', () => {
 
     await queue.onIdle();
     expect(arubaCalled).toBe(true);
+  });
+});
+
+describe('processJob: charge.refunded uses stripeRefundId, not refunds.data[0] (Comment 1)', () => {
+  it('triggering refund is not data[0] — correct amount used via stripeRefundId', async () => {
+    // data[0] is a previous 5000-cent refund; the triggering refund re_test_second (7200) is data[1].
+    // stripeRefundId is set to re_test_second at webhook time.
+    const chargeRefundedJob = {
+      ...pendingValidJob,
+      id: 'job_refund_second',
+      eventType: 'charge.refunded',
+      stripeInvoiceId: 'in_test_001',
+      stripeRefundId: 're_test_second',
+      rawPayload: JSON.stringify({
+        id: 'evt_refund_second',
+        type: 'charge.refunded',
+        data: {
+          object: {
+            id: 'ch_test_multi',
+            invoice: 'in_test_001',
+            amount: 12200,
+            amount_refunded: 12200,
+            currency: 'eur',
+            created: 1700000200,
+            refunds: {
+              data: [
+                { id: 're_test_first', amount: 5000 },
+                { id: 're_test_second', amount: 7200 },
+              ],
+            },
+          },
+        },
+      }),
+    };
+
+    // Override the invoice retrieve to return a total matching 7200 (the triggering refund)
+    server.use(
+      http.get(`${STRIPE_BASE}/v1/invoices/:invoiceId`, () =>
+        HttpResponse.json({
+          ...stripeExpandedInvoice,
+          total: 7200,
+          lines: {
+            object: 'list',
+            data: [
+              {
+                id: 'il_002',
+                object: 'line_item',
+                amount: 7200,
+                description: 'Servizio SaaS',
+                quantity: 1,
+                tax_amounts: [],
+              },
+            ],
+          },
+        }),
+      ),
+    );
+
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+    mockFindUnique.mockResolvedValue(chargeRefundedJob);
+    mockUpdate.mockResolvedValue({});
+
+    await processJob('job_refund_second');
+
+    // Must have successfully created a CREATED_DRAFT job — normalization passed with 7200 amount
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'CREATED_DRAFT',
+          arubaInvoiceId: 'aruba-inv-001',
+        }),
+      }),
+    );
+  });
+});
+
+describe('processJob: durable metadata sync for failure states (Comment 2)', () => {
+  it('metadata sync fails after FAILED_VALIDATION → persisted as FAILED, alerted, retried without Aruba', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+    mockFindUnique.mockResolvedValue(pendingInvalidJob);
+    mockUpdate.mockResolvedValue({});
+    // metadata sync throws on first call (during failure path)
+    mockUpdateStripeMetadata.mockRejectedValue(new Error('Stripe rate limit'));
+
+    server.use(
+      http.get(`${STRIPE_BASE}/v1/invoices/:invoiceId`, () =>
+        HttpResponse.json({
+          ...stripeExpandedInvoice,
+          customer: { id: 'cus_test_001', object: 'customer', metadata: {} },
+        }),
+      ),
+    );
+
+    await processJob('job_003');
+
+    // First update: FAILED_VALIDATION + PENDING sync marker
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'FAILED_VALIDATION',
+          metadataSyncStatus: 'PENDING',
+        }),
+      }),
+    );
+    // Second update: sync marked FAILED
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { metadataSyncStatus: 'FAILED' } }),
+    );
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+
+    // Alert for validation failure + alert for metadata sync failure
+    expect(mockSendAlert).toHaveBeenCalledTimes(2);
+    const reasons = (mockSendAlert.mock.calls as Array<[{ reason: string }]>).map(
+      ([p]) => p.reason,
+    );
+    expect(reasons.some((r) => r.toLowerCase().includes('validation'))).toBe(true);
+    expect(reasons.some((r) => r.toLowerCase().includes('metadata'))).toBe(true);
+  });
+
+  it('metadata sync fails after 4xx Aruba rejection → persisted as FAILED, alerted, no second Aruba call', async () => {
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+    mockFindUnique.mockResolvedValue(pendingValidJob);
+    mockUpdate.mockResolvedValue({});
+    mockUpdateStripeMetadata.mockRejectedValue(new Error('Stripe 503'));
+
+    let uploadCount = 0;
+    server.use(
+      http.post(`${DEMO_BASE}/auth/signin`, () => HttpResponse.json(validTokenResponse)),
+      http.post(`${DEMO_BASE}/services/invoice/out/uploadFile`, () => {
+        uploadCount++;
+        return HttpResponse.json({ error: 'Bad data' }, { status: 400 });
+      }),
+    );
+
+    await processJob('job_001');
+
+    // Aruba called exactly once — the initial failing call; metadata failure must not trigger a re-call
+    expect(uploadCount).toBe(1);
+
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'FAILED_VALIDATION',
+          metadataSyncStatus: 'PENDING',
+        }),
+      }),
+    );
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { metadataSyncStatus: 'FAILED' } }),
+    );
+    // Two alerts: one for Aruba rejection, one for metadata sync failure
+    expect(mockSendAlert).toHaveBeenCalledTimes(2);
+  });
+
+  it('metadata retry for FAILED failure-state (null arubaInvoiceId) retries without Aruba', async () => {
+    const jobWithFailedMetaNoAruba = {
+      ...pendingValidJob,
+      status: 'FAILED_VALIDATION',
+      arubaInvoiceId: null,
+      metadataSyncStatus: META_SYNC_FAILED,
+      alerted: true,  // processor sent alert inline when it created this failure state
+    };
+
+    mockUpdateMany.mockResolvedValue({ count: 0 });
+    mockFindUnique.mockResolvedValue(jobWithFailedMetaNoAruba);
+    mockUpdate.mockResolvedValue({});
+    mockUpdateStripeMetadata.mockResolvedValue(undefined);
+
+    let arubaCalled = false;
+    server.use(
+      http.post(`${DEMO_BASE}/services/invoice/out/uploadFile`, () => {
+        arubaCalled = true;
+        return HttpResponse.json({ arubaInvoiceId: 'aruba-inv-new' });
+      }),
+    );
+
+    await processJob('job_001');
+
+    expect(arubaCalled).toBe(false);
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledOnce();
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledWith('in_test_001', null, 'FAILED_VALIDATION');
+    expect(mockUpdate).toHaveBeenCalledOnce();
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { metadataSyncStatus: 'OK' } }),
+    );
+  });
+});
+
+describe('processJob: webhook FAILED_VALIDATION with stripeRefundId=null', () => {
+  it('no Aruba call, sendAlert once with lastError reason, metadata write-back attempted', async () => {
+    // Job was created FAILED_VALIDATION by the webhook (ambiguous refund); alerted=false so the
+    // worker must send exactly one alert and then attempt the Stripe metadata write-back.
+    const webhookFailedJob = {
+      ...pendingValidJob,
+      id: 'job_ambig_refund',
+      eventType: 'charge.refunded',
+      stripeRefundId: null,
+      status: 'FAILED_VALIDATION',
+      lastError: 'Unable to identify triggering Stripe refund deterministically',
+      metadataSyncStatus: META_SYNC_PENDING,
+      alerted: false,
+    };
+
+    // Claim fails — job is FAILED_VALIDATION, not PENDING
+    // Second updateMany = alert gate; it wins and returns count:1.
+    mockUpdateMany
+      .mockResolvedValueOnce({ count: 0 })  // initial claim
+      .mockResolvedValueOnce({ count: 1 }); // alert gate wins
+    mockFindUnique.mockResolvedValue(webhookFailedJob);
+    mockUpdate.mockResolvedValue({});
+    mockUpdateStripeMetadata.mockResolvedValue(undefined);
+
+    let arubaCalled = false;
+    server.use(
+      http.post(`${DEMO_BASE}/services/invoice/out/uploadFile`, () => {
+        arubaCalled = true;
+        return HttpResponse.json({ arubaInvoiceId: 'aruba-inv-001' });
+      }),
+    );
+
+    await processJob('job_ambig_refund');
+
+    expect(arubaCalled).toBe(false);
+
+    // Exactly one alert with the original lastError as reason
+    expect(mockSendAlert).toHaveBeenCalledOnce();
+    const alertPayload = mockSendAlert.mock.calls[0][0] as { reason: string; errors: string[] };
+    expect(alertPayload.reason).toBe('Unable to identify triggering Stripe refund deterministically');
+    expect(alertPayload.errors).toContain('Unable to identify triggering Stripe refund deterministically');
+
+    // Alert gate used atomic updateMany (not update) with alerted:false constraint
+    expect(mockUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ alerted: false }),
+        data: { alerted: true },
+      }),
+    );
+    // Only update: metadata sync OK
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { metadataSyncStatus: META_SYNC_OK } }),
+    );
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledOnce();
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledWith('in_test_001', null, 'FAILED_VALIDATION');
+  });
+});
+
+describe('processJob: atomic alert deduplication (Comment 2)', () => {
+  it('two concurrent workers racing on alerted=false failure job → only one alert sent', async () => {
+    const failureJob = {
+      ...pendingValidJob,
+      id: 'job_fail_concurrent',
+      status: 'FAILED_VALIDATION' as const,
+      lastError: 'Some error',
+      alerted: false,
+      metadataSyncStatus: null,
+    };
+
+    // Both workers call updateMany in call order (not worker order) before any promise resolves.
+    // Order: [w1 main claim, w2 main claim, first alert gate, second alert gate]
+    mockUpdateMany
+      .mockResolvedValueOnce({ count: 0 }) // call 1: w1 main claim fails
+      .mockResolvedValueOnce({ count: 0 }) // call 2: w2 main claim fails
+      .mockResolvedValueOnce({ count: 1 }) // call 3: first alert gate wins
+      .mockResolvedValueOnce({ count: 0 }); // call 4: second alert gate loses
+
+    mockFindUnique
+      .mockResolvedValueOnce(failureJob)
+      .mockResolvedValueOnce(failureJob);
+
+    mockUpdate.mockResolvedValue({});
+
+    await Promise.all([
+      processJob('job_fail_concurrent'),
+      processJob('job_fail_concurrent'),
+    ]);
+
+    expect(mockSendAlert).toHaveBeenCalledOnce();
   });
 });
 

@@ -2,6 +2,8 @@ import { http, HttpResponse } from 'msw';
 
 export const DEMO_BASE = 'https://demows.fatturazioneelettronica.aruba.it';
 export const PROD_BASE = 'https://ws.fatturazioneelettronica.aruba.it';
+export const DEMO_AUTH_BASE = 'https://demoauth.fatturazioneelettronica.aruba.it';
+export const PROD_AUTH_BASE = 'https://auth.fatturazioneelettronica.aruba.it';
 
 export const validTokenResponse = {
   access_token: 'test-access-token',
@@ -18,7 +20,15 @@ export const demoSigninHandler = http.post(`${DEMO_BASE}/auth/signin`, () =>
   HttpResponse.json(validTokenResponse),
 );
 
+export const demoAuthSigninHandler = http.post(`${DEMO_AUTH_BASE}/auth/signin`, () =>
+  HttpResponse.json(validTokenResponse),
+);
+
 export const prodSigninHandler = http.post(`${PROD_BASE}/auth/signin`, () =>
+  HttpResponse.json({ ...validTokenResponse, access_token: 'prod-access-token' }),
+);
+
+export const prodAuthSigninHandler = http.post(`${PROD_AUTH_BASE}/auth/signin`, () =>
   HttpResponse.json({ ...validTokenResponse, access_token: 'prod-access-token' }),
 );
 
@@ -97,7 +107,9 @@ export const demoUploadNetworkErrorHandler = http.post(
 
 export const defaultArubaHandlers = [
   demoSigninHandler,
+  demoAuthSigninHandler,
   prodSigninHandler,
+  prodAuthSigninHandler,
   demoUploadSuccessHandler,
   demoUploadAndSendSuccessHandler,
   prodUploadSuccessHandler,
