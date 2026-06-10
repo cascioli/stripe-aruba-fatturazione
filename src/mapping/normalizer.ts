@@ -33,6 +33,8 @@ export interface StripeInvoice {
   total: number;
   lines: { data: StripeLineItem[] };
   metadata?: Record<string, string>;
+  /** Customer metadata embedded in the webhook payload (Stripe expands this in invoice events). */
+  customer_metadata?: Record<string, string>;
 }
 
 export interface StripeCharge {
