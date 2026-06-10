@@ -285,8 +285,19 @@ export async function processJob(jobId: string): Promise<void> {
           lastError: 'Fiscal document already issued by another job',
           lockedAt: null,
           lockedBy: null,
+          metadataSyncStatus: job.stripeInvoiceId ? META_SYNC_PENDING : null,
+          alerted: true,
         },
       });
+      await sendAlert({
+        jobId,
+        stripeInvoiceId: job.stripeInvoiceId,
+        reason: 'Fiscal document already issued by another job',
+        errors: ['Fiscal document already issued by another job'],
+      });
+      if (job.stripeInvoiceId) {
+        await retryMetadataSync({ ...job, arubaInvoiceId: null, status: JobStatus.ERROR });
+      }
       return;
     }
   }

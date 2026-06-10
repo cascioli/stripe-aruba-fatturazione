@@ -943,6 +943,62 @@ describe('processJob: atomic alert deduplication (Comment 2)', () => {
   });
 });
 
+describe('processJob: duplicate fiscalDocumentKey guard', () => {
+  it('existing issued job with same fiscalDocumentKey → ERROR, no Aruba call, one alert, Stripe metadata write-back', async () => {
+    const jobWithKey = {
+      ...pendingValidJob,
+      id: 'job_dup_key',
+      fiscalDocumentKey: 'in_test_001:TD01',
+    };
+
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+    mockFindUnique.mockResolvedValue(jobWithKey);
+    mockUpdate.mockResolvedValue({});
+    mockFindFirst.mockResolvedValue({
+      id: 'job_already_issued',
+      fiscalDocumentKey: 'in_test_001:TD01',
+      arubaInvoiceId: 'aruba-inv-existing',
+    });
+
+    let arubaCalled = false;
+    server.use(
+      http.post(`${DEMO_BASE}/services/invoice/out/uploadFile`, () => {
+        arubaCalled = true;
+        return HttpResponse.json({ arubaInvoiceId: 'aruba-inv-new' });
+      }),
+    );
+
+    await processJob('job_dup_key');
+
+    expect(arubaCalled).toBe(false);
+
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'job_dup_key' },
+        data: expect.objectContaining({
+          status: 'ERROR',
+          lastError: 'Fiscal document already issued by another job',
+          metadataSyncStatus: META_SYNC_PENDING,
+          alerted: true,
+        }),
+      }),
+    );
+
+    expect(mockSendAlert).toHaveBeenCalledOnce();
+    const alertPayload = mockSendAlert.mock.calls[0][0] as { reason: string };
+    expect(alertPayload.reason).toBe('Fiscal document already issued by another job');
+
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledOnce();
+    expect(mockUpdateStripeMetadata).toHaveBeenCalledWith('in_test_001', null, 'ERROR');
+
+    // Two updates: ERROR status + metadata sync OK
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { metadataSyncStatus: META_SYNC_OK } }),
+    );
+  });
+});
+
 describe('enqueue: deduplication', () => {
   it('duplicate enqueue while job in-flight is ignored — only one upload call', async () => {
     mockUpdateMany.mockResolvedValue({ count: 1 });

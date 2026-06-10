@@ -1,2 +1,1 @@
--- AlterTable
-ALTER TABLE "FatturaJob" ADD COLUMN "alerted" BOOLEAN NOT NULL DEFAULT false;
+-- no-op: "alerted" column included in baseline 20260609000000_init migration
