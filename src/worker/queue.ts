@@ -1,6 +1,6 @@
 import PQueue from 'p-queue';
 import { prisma } from '../db/prisma.js';
-import { processJob } from './processor.js';
+import { processJob, STALE_LOCK_MS, META_SYNC_PENDING, META_SYNC_FAILED } from './processor.js';
 
 export const queue = new PQueue({ concurrency: 1 });
 
@@ -31,10 +31,25 @@ export function stopWorker(): void {
 
 async function pollPendingJobs(): Promise<void> {
   const now = new Date();
+  const staleCutoff = new Date(now.getTime() - STALE_LOCK_MS);
+
   const jobs = await prisma.fatturaJob.findMany({
     where: {
-      status: 'PENDING',
-      OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+      OR: [
+        // PENDING jobs ready for Aruba — skip freshly locked ones to avoid collisions
+        {
+          status: 'PENDING',
+          AND: [
+            { OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }] },
+            { OR: [{ lockedAt: null }, { lockedAt: { lte: staleCutoff } }] },
+          ],
+        },
+        // Jobs that finished Aruba but still need the Stripe metadata write-back
+        {
+          arubaInvoiceId: { not: null },
+          metadataSyncStatus: { in: [META_SYNC_PENDING, META_SYNC_FAILED] },
+        },
+      ],
     },
     select: { id: true },
     take: 50,

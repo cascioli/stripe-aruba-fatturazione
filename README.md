@@ -48,7 +48,7 @@ Stripe ──POST /webhook──►  1. Verify HMAC signature               │
 | `DATABASE_URL` | Yes | — | Prisma DB URL. SQLite only (`file:./dev.db`). The current `prisma/schema.prisma` uses `provider = "sqlite"` — PostgreSQL is not supported without updating the schema and migrations. |
 | `STRIPE_SECRET_KEY` | Yes | — | Stripe secret key. Must start with `sk_test_` when `ARUBA_ENV=DEMO`. |
 | `STRIPE_WEBHOOK_SECRET` | Yes | — | Webhook signing secret (`whsec_...`). From Dashboard endpoint or `stripe listen`. |
-| `ARUBA_ENV` | No | `DEMO` | `DEMO` = Aruba sandbox. `PROD` = live SDI. `DEMO` requires `sk_test_` (enforced at boot). Use `sk_live_` for `PROD` (not enforced, but required by Stripe). |
+| `ARUBA_ENV` | No | `DEMO` | `DEMO` = Aruba sandbox. `PROD` = live SDI. `DEMO` requires `sk_test_`; `PROD` requires `sk_live_` — both enforced at boot. |
 | `ARUBA_SEND_MODE` | No | `DRAFT` | `DRAFT` = create bozza (no SDI send). `DIRECT` = send to SDI immediately. |
 | `ARUBA_USERNAME` | Yes | — | Aruba account email. |
 | `ARUBA_PASSWORD` | Yes | — | Aruba account password. |
@@ -147,14 +147,16 @@ Every Stripe event is stored with `stripeEventId UNIQUE`. Duplicate deliveries h
 
 ### DEMO/PROD isolation
 
-Boot enforces one rule:
+Boot enforces a **bidirectional** key-pairing rule:
 
 ```
 ARUBA_ENV=DEMO  →  STRIPE_SECRET_KEY must start with sk_test_  (enforced — boot fails otherwise)
-ARUBA_ENV=PROD  →  use sk_live_...  (operational requirement, not checked at boot)
+ARUBA_ENV=PROD  →  STRIPE_SECRET_KEY must start with sk_live_  (enforced — boot fails otherwise)
 ```
 
-Using a live Stripe key against the Aruba demo environment is **rejected at startup** — this prevents real customer data from being sent to a test system. The reverse (`ARUBA_ENV=PROD` + `sk_test_`) is not blocked programmatically; ensure you set `sk_live_` before pointing to the Aruba production endpoint.
+Both directions are rejected at startup. This prevents real customer data from reaching the Aruba sandbox, and prevents test events from creating real fiscal documents on the Aruba production endpoint.
+
+In addition, every incoming webhook event is validated at the handler level: the Stripe event's `livemode` flag must match `ARUBA_ENV` before the job is enqueued. A `livemode=true` event received when `ARUBA_ENV=DEMO` (or vice-versa) is silently acknowledged with `200` and dropped — no job is created.
 
 Aruba URLs are resolved at runtime:
 

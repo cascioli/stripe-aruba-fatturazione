@@ -36,11 +36,20 @@ STRIPE_WEBHOOK_SECRET=whsec_...
 | `sk_test_...` | Test (DEMO) | Fittizi, nessun addebito | No |
 | `sk_live_...` | Produzione | Reali | Sì |
 
-**Regola di sicurezza applicata al boot:** se `ARUBA_ENV=DEMO`, il server rifiuta di avviarsi con una chiave `sk_live_`. Questo impedisce di inviare fatture false all'ambiente di test Aruba usando dati Stripe reali.
+**Regola di sicurezza applicata al boot (bidirezionale):** il server verifica che la chiave Stripe corrisponda all'ambiente Aruba configurato in entrambe le direzioni.
+
+| `ARUBA_ENV` | `STRIPE_SECRET_KEY` richiesta | Comportamento se errata |
+|---|---|---|
+| `DEMO` | deve iniziare con `sk_test_` | avvio fallisce |
+| `PROD` | deve iniziare con `sk_live_` | avvio fallisce |
+
+Questo impedisce sia di inviare fatture reali all'ambiente demo Aruba, sia di creare documenti fiscali reali tramite eventi di test Stripe.
+
+In aggiunta, ogni webhook ricevuto viene validato in tempo reale: il flag `livemode` dell'evento Stripe deve corrispondere ad `ARUBA_ENV`. Eventuali mismatch vengono ignorati silenziosamente con `200` — nessun job viene creato.
 
 ```
-STRIPE_SECRET_KEY=sk_test_...   # DEMO
-STRIPE_SECRET_KEY=sk_live_...   # PROD
+STRIPE_SECRET_KEY=sk_test_...   # DEMO (obbligatorio)
+STRIPE_SECRET_KEY=sk_live_...   # PROD (obbligatorio)
 ```
 
 ### 1.4 Metadati fiscali sul Customer

@@ -14,6 +14,10 @@ model FatturaJob {
   id                  String    @id @default(cuid())
   stripeEventId       String    @unique
   stripeInvoiceId     String?
+  stripeRefundId      String?
+  // Unique fiscal document key — prevents double Aruba invoices for the same Stripe document.
+  // Format: "<invoiceId>:TD01" | "<invoiceId>:TD04:voided" | "<invoiceId>:TD04:<refundId>"
+  fiscalDocumentKey   String?   @unique
   eventType           String    // invoice.paid | charge.refunded | invoice.voided
 
   status              String    @default("PENDING")
@@ -21,6 +25,14 @@ model FatturaJob {
 
   arubaInvoiceId      String?
   arubaUploadFileName String?
+
+  // Tracks metadata write-back to Stripe independently of Aruba status.
+  // null = not yet needed | PENDING = Aruba done, sync not yet attempted | OK = synced | FAILED = needs retry
+  metadataSyncStatus  String?
+
+  // Optimistic lock fields for atomic job claiming — prevents concurrent Aruba calls.
+  lockedAt            DateTime?
+  lockedBy            String?
 
   retryCount          Int       @default(0)
   nextRetryAt         DateTime?
@@ -33,4 +45,5 @@ model FatturaJob {
 
   @@index([status, nextRetryAt])
   @@index([stripeEventId])
+  @@index([fiscalDocumentKey])
 }

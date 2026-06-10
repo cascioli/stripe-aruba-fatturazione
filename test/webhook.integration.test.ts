@@ -56,6 +56,8 @@ describe('POST /webhook (integration – real SQLite)', () => {
     expect(job?.stripeEventId).toBe(invoicePaidEvent.id);
     expect(job?.eventType).toBe('invoice.paid');
     expect(job?.status).toBe('PENDING');
+    // Fiscal document key is derived from invoice ID
+    expect(job?.fiscalDocumentKey).toBe(`${invoicePaidEvent.data.object.id}:TD01`);
   });
 
   it('invalid signature → no row persisted', async () => {
@@ -125,6 +127,52 @@ describe('POST /webhook (integration – real SQLite)', () => {
     expect(await testPrisma.fatturaJob.count()).toBe(1);
   });
 
+  it('two different invoice.paid events for same invoice → second ignored via fiscalDocumentKey', async () => {
+    // First event — creates job with fiscalDocumentKey = "<invoiceId>:TD01"
+    const payload1 = JSON.stringify(invoicePaidEvent);
+    const { sig: sig1 } = makeSignedRequest(payload1);
+    const first = await app.inject({
+      method: 'POST',
+      url: '/webhook',
+      headers: { 'stripe-signature': sig1, 'content-type': 'application/json' },
+      payload: payload1,
+    });
+    expect(first.statusCode).toBe(200);
+    expect(await testPrisma.fatturaJob.count()).toBe(1);
+
+    // Second event — different Stripe event ID, same invoice ID → same fiscalDocumentKey → P2002
+    const secondEvent = { ...invoicePaidEvent, id: 'evt_test_invoice_paid_duplicate_002' };
+    const payload2 = JSON.stringify(secondEvent);
+    const { sig: sig2 } = makeSignedRequest(payload2);
+    const second = await app.inject({
+      method: 'POST',
+      url: '/webhook',
+      headers: { 'stripe-signature': sig2, 'content-type': 'application/json' },
+      payload: payload2,
+    });
+
+    // Idempotent 200, no second job created
+    expect(second.statusCode).toBe(200);
+    expect(await testPrisma.fatturaJob.count()).toBe(1);
+  });
+
+  it('livemode=true event with ARUBA_ENV=DEMO → 200 but no job created', async () => {
+    // ARUBA_ENV=DEMO (set in test/setup.ts) expects livemode=false; live events are ignored
+    const livemodeEvent = { ...invoicePaidEvent, id: 'evt_live_mismatch_001', livemode: true };
+    const payload = JSON.stringify(livemodeEvent);
+    const { sig } = makeSignedRequest(payload);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhook',
+      headers: { 'stripe-signature': sig, 'content-type': 'application/json' },
+      payload,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(await testPrisma.fatturaJob.count()).toBe(0);
+  });
+
   it('invoice.paid then invoice.voided for same invoice → two rows in DB', async () => {
     const paidPayload = JSON.stringify(invoicePaidEvent);
     const { sig: sig1 } = makeSignedRequest(paidPayload);
@@ -178,6 +226,9 @@ describe('POST /webhook (integration – real SQLite)', () => {
           id: 'ch_test_001',
           object: 'charge' as const,
           invoice: 'in_test_invoice_001',
+          refunds: {
+            data: [{ id: 're_test_001', amount: 12200 }],
+          },
         },
       },
     };
@@ -196,5 +247,7 @@ describe('POST /webhook (integration – real SQLite)', () => {
     expect(jobs[0].eventType).toBe('invoice.paid');
     expect(jobs[1].eventType).toBe('charge.refunded');
     expect(jobs[1].stripeInvoiceId).toBe('in_test_invoice_001');
+    expect(jobs[1].stripeRefundId).toBe('re_test_001');
+    expect(jobs[1].fiscalDocumentKey).toBe('in_test_invoice_001:TD04:re_test_001');
   });
 });
